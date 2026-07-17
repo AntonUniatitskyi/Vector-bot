@@ -1,10 +1,14 @@
 from datetime import datetime
+from os import getenv
 
+from dotenv import load_dotenv
 from sqlalchemy import Boolean, DateTime, String, Text, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-DB_URL = "sqlite+aiosqlite:///vector.db"
+load_dotenv()
+
+DB_URL = getenv("DB_URL", "sqlite+aiosqlite:///vector.db")
 
 engine = create_async_engine(DB_URL)
 async_session: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
@@ -71,3 +75,10 @@ async def url_exists(url: str) -> bool:
     async with async_session() as session:
         result = await session.execute(select(Post).where(Post.source_url == url))
         return result.scalar_one_or_none() is not None
+
+async def get_recent_titles(limit: int = 10) -> list[str]:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Post.title).order_by(Post.created_at.desc()).limit(limit)
+        )
+        return [title for (title,) in result.all() if title]
