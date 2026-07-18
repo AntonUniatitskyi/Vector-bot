@@ -109,7 +109,8 @@ Google круглосуточно отправляет по всему миру 
 привязки к конкретному изданию/сайту.
 
 РАЗМЕТКА (обязательно соблюдай):
-Используй ТОЛЬКО теги Telegram HTML — <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">. \
+Используй ТОЛЬКО теги Telegram HTML — <b>, <i>, <u>, <s>, <code>, <pre>. \
+Тег <a href="..."> НЕ используй вообще (см. правило про источники выше). \
 Никаких других HTML-тегов (без <p>, <ul>, <li> и т.д.). Если в тексте встречаются символы \
 <, > или & не как часть разрешённого тега — экранируй их как &lt; &gt; &amp;.
 
@@ -118,7 +119,6 @@ Google круглосуточно отправляет по всему миру 
 2. Крючок-завязка (сценка / вопрос / тизер-спойлер / мини-цепочка действий)
 3. Разбор по существу — emoji-подзаголовки ИЛИ нумерованный список приёмов
 4. Пример команды/кода в <code>/<pre>, если это тул или техника
-5. Ссылка на первоисточник — ТОЛЬКО если он реально есть в материалах
 """
 
 
@@ -128,7 +128,7 @@ async def generate_post(idea: str, search_results: list[dict]) -> str:
             f"- {r['title']}: {r['body']} ({r['href']})" for r in search_results
         )
     else:
-        sources_block = "Поиск не дал результатов — используй свои знания, без ссылки на источник."
+        sources_block = "Поиск не дал результатов — используй свои знания."
 
     prompt = f"""\
 Тема запроса от редактора: {idea}
@@ -147,31 +147,7 @@ async def generate_post(idea: str, search_results: list[dict]) -> str:
     return response.text
 
 
-async def rewrite_post(original_text: str) -> str:
-    """Просит модель переписать уже готовый черновик другим стилем."""
-    prompt = f"""\
-Вот черновик поста для Telegram-канала:
-
-{original_text}
-
-Перепиши его: сделай короче, техничнее и динамичнее. Сохрани структуру, \
-ссылку на источник (если была) и правила HTML-разметки.
-"""
-
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-    )
-    return response.text
-
-
 async def generate_post_stream(idea: str, search_results: list[dict]):
-    """
-    Потоковая версия generate_post — асинхронный генератор, отдающий
-    НАКОПЛЕННЫЙ текст (а не отдельные дельты) по мере генерации.
-    Используется для стриминга черновика в Telegram через SendMessageDraft.
-    """
     if search_results:
         sources_block = "\n".join(
             f"- {r['title']}: {r['body']} ({r['href']})" for r in search_results
@@ -199,6 +175,24 @@ async def generate_post_stream(idea: str, search_results: list[dict]):
         if chunk.text:
             buffer += chunk.text
             yield buffer
+
+
+async def rewrite_post(original_text: str) -> str:
+    prompt = f"""\
+Вот черновик поста для Telegram-канала:
+
+{original_text}
+
+Перепиши его: сделай короче, техничнее и динамичнее. Сохрани структуру и \
+правила HTML-разметки.
+"""
+
+    response = await client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    )
+    return response.text
 
 
 async def brainstorm_topic(recent_titles: list[str]) -> str:
