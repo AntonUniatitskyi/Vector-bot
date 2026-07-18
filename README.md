@@ -115,4 +115,4 @@ Telegram → Router → AdminProtectFilter → Handler
 
 ## Лицензия
 
-MIT — делай что хочешь, автор не отвечает за последствия.
+GPL V3.
