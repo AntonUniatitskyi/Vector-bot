@@ -1,0 +1,11 @@
+services:
+  vector-bot:
+    build: .
+    container_name: vector-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DB_URL=sqlite+aiosqlite:///data/vector.db
+    volumes:
+      - ./data:/app/data

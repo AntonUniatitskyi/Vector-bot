@@ -82,3 +82,34 @@ async def get_recent_titles(limit: int = 10) -> list[str]:
             select(Post.title).order_by(Post.created_at.desc()).limit(limit)
         )
         return [title for (title,) in result.all() if title]
+
+
+async def add_source(url: str, source_type: str) -> Source:
+    async with async_session() as session:
+        source = Source(url=url, source_type=source_type, is_active=True)
+        session.add(source)
+        await session.commit()
+        await session.refresh(source)
+        return source
+
+
+async def list_sources() -> list[Source]:
+    async with async_session() as session:
+        result = await session.execute(select(Source).order_by(Source.id))
+        return list(result.scalars().all())
+
+
+async def list_active_sources() -> list[Source]:
+    async with async_session() as session:
+        result = await session.execute(select(Source).where(Source.is_active.is_(True)))
+        return list(result.scalars().all())
+
+
+async def toggle_source(source_id: int) -> Source | None:
+    async with async_session() as session:
+        source = await session.get(Source, source_id)
+        if source is not None:
+            source.is_active = not source.is_active
+            await session.commit()
+            await session.refresh(source)
+        return source

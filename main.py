@@ -1,8 +1,8 @@
 import asyncio
 import logging
+import re
 import time
 from os import getenv
-import re
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -14,26 +14,32 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.methods import SendMessageDraft
 from aiogram.types import (
     CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message, ReplyKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
 )
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
+
+import autopilot
 import db
 import llm
 import search
+from ui import get_moderation_keyboard, safe_send
 
 load_dotenv()
 
 BOT_TOKEN = getenv("BOT_TOKEN")
 ADMIN_ID = int(getenv("ADMIN_ID", "0"))
-CHANNEL_ID = int(getenv("CHANNEL_ID", "0"))
+CHANNEL_ID = getenv("CHANNEL_ID")
+AUTOPILOT_INTERVAL_HOURS = int(getenv("AUTOPILOT_INTERVAL_HOURS", "3"))
 
 IDEA_BUTTON_TEXT = "💡 Новая идея"
 RANDOM_BUTTON_TEXT = "🎲 Придумай сам"
+
 router = Router()
+
 
 class IdeaStates(StatesGroup):
     waiting_for_idea = State()
@@ -43,8 +49,10 @@ class AdminProtectFilter(Filter):
     async def __call__(self, obj: Message | CallbackQuery) -> bool:
         return obj.from_user.id == ADMIN_ID
 
+
 router.message.filter(AdminProtectFilter())
 router.callback_query.filter(AdminProtectFilter())
+
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
@@ -53,35 +61,27 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
-def get_moderation_keyboard(post_id: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub_{post_id}"),
-            InlineKeyboardButton(text="✏️ Переписать", callback_data=f"rew_{post_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🗑 Отклонить", callback_data=f"rej_{post_id}")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
+
 def _strip_tags_for_preview(text: str) -> str:
+    """
+    Черновик (SendMessageDraft) отправляется БЕЗ parse_mode — потому что
+    посреди генерации текст может обрываться на незакрытом теге (<b>текст
+    без закрыва), и Telegram уронит запрос с ошибкой парсинга entities.
+    Поэтому для превью просто вырезаем теги — красивое форматирование
+    появится только в финальном сообщении.
+    """
     return _TAG_RE.sub("", text)
 
-async def safe_send(message: Message, text: str, post_id: int) -> None:
-    try:
-        await message.answer(text=text, reply_markup=get_moderation_keyboard(post_id))
-    except TelegramBadRequest:
-        logging.warning("LLM сгенерировала невалидный HTML, отправляю как обычный текст")
-        await message.answer(
-            text=text, reply_markup=get_moderation_keyboard(post_id), parse_mode=None
-        )
 
-
+# ---------------------------------------------------------------------------
+# Общая логика генерации черновика — используется и командой, и кнопкой
+# ---------------------------------------------------------------------------
 async def process_idea(message: Message, idea_text: str, bot: Bot) -> None:
     await message.answer(f"🔍 Принял в разведку: <b>«{idea_text}»</b>")
+
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
         try:
             results = await search.web_search(idea_text)
@@ -89,7 +89,8 @@ async def process_idea(message: Message, idea_text: str, bot: Bot) -> None:
             logging.exception("Ошибка при поиске")
             await message.answer("⚠️ Не получилось найти информацию. Попробуй ещё раз.")
             return
-    draft_id = int(time.time() * 1000) % (2 ** 31) or 1
+
+    draft_id = int(time.time() * 1000) % (2**31) or 1
     final_text = ""
     last_update = 0.0
 
@@ -125,16 +126,25 @@ async def process_idea(message: Message, idea_text: str, bot: Bot) -> None:
     await safe_send(message, final_text, post.id)
 
 
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 Привет, создатель! Система Vector готова к работе.\n"
         f"«{IDEA_BUTTON_TEXT}» — сам предложи тему.\n"
         f"«{RANDOM_BUTTON_TEXT}» — модель придумает тему сама.\n"
-        "Либо сразу /idea [текст].",
+        "Либо сразу /idea [текст].\n\n"
+        "Автопилот работает в фоне каждые "
+        f"{AUTOPILOT_INTERVAL_HOURS} ч. Команды: /check_now, /sources, /togglesource [id]",
         reply_markup=get_main_keyboard(),
     )
 
+
+# ---------------------------------------------------------------------------
+# Вариант 1: команда /idea с аргументом сразу
+# ---------------------------------------------------------------------------
 @router.message(Command("idea"))
 async def cmd_idea(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
     idea_text = (command.args or "").strip()
@@ -150,6 +160,9 @@ async def cmd_idea(message: Message, command: CommandObject, state: FSMContext, 
     await process_idea(message, idea_text, bot)
 
 
+# ---------------------------------------------------------------------------
+# Вариант 2: кнопка внизу -> бот спрашивает -> следующее сообщение = идея
+# ---------------------------------------------------------------------------
 @router.message(F.text == IDEA_BUTTON_TEXT)
 async def btn_idea(message: Message, state: FSMContext) -> None:
     await state.set_state(IdeaStates.waiting_for_idea)
@@ -176,6 +189,52 @@ async def btn_random(message: Message, bot: Bot) -> None:
     await process_idea(message, topic, bot)
 
 
+# ---------------------------------------------------------------------------
+# Автопилот: ручной запуск + управление источниками
+# ---------------------------------------------------------------------------
+@router.message(Command("check_now"))
+async def cmd_check_now(message: Message, bot: Bot) -> None:
+    await message.answer("🛰 Запускаю внеплановую проверку источников...")
+    await autopilot.run_autopilot_check(bot)
+    await message.answer("✅ Проверка завершена (новые черновики, если есть, уже в чате выше).")
+
+
+@router.message(Command("sources"))
+async def cmd_sources(message: Message) -> None:
+    sources = await db.list_sources()
+    if not sources:
+        await message.answer("Источников пока нет.")
+        return
+
+    lines = []
+    for s in sources:
+        status = "🟢" if s.is_active else "⚪️"
+        lines.append(f"{status} <code>{s.id}</code> [{s.source_type}] {s.url}")
+
+    await message.answer(
+        "\n".join(lines) + "\n\n<i>Включить/выключить: /togglesource [id]</i>"
+    )
+
+
+@router.message(Command("togglesource"))
+async def cmd_togglesource(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("⚠️ Использование: <code>/togglesource 3</code>")
+        return
+
+    source = await db.toggle_source(int(arg))
+    if source is None:
+        await message.answer("⚠️ Источник с таким id не найден.")
+        return
+
+    status = "включён 🟢" if source.is_active else "выключен ⚪️"
+    await message.answer(f"Источник {source.id} теперь {status}.")
+
+
+# ---------------------------------------------------------------------------
+# Модерация черновиков
+# ---------------------------------------------------------------------------
 @router.callback_query(F.data.startswith("pub_"))
 async def cb_publish(callback: CallbackQuery, bot: Bot) -> None:
     post_id = int(callback.data.removeprefix("pub_"))
@@ -185,11 +244,25 @@ async def cb_publish(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Черновик не найден или уже обработан", show_alert=True)
         return
 
-    sent = await bot.send_message(chat_id=CHANNEL_ID, text=post.content)
+    try:
+        sent = await bot.send_message(chat_id=CHANNEL_ID, text=post.content)
+    except TelegramBadRequest:
+        logging.warning("Невалидный HTML при публикации в канал, шлю как обычный текст")
+        sent = await bot.send_message(chat_id=CHANNEL_ID, text=post.content, parse_mode=None)
+
     await db.set_post_status(post_id, "published")
 
     await callback.message.edit_text(f"✅ <b>Опубликовано в канал</b> (id поста: {sent.message_id})")
     await callback.answer("Готово!")
+
+
+@router.callback_query(F.data.startswith("rej_"))
+async def cb_reject(callback: CallbackQuery) -> None:
+    post_id = int(callback.data.removeprefix("rej_"))
+    await db.set_post_status(post_id, "rejected")
+
+    await callback.message.edit_text("🗑 <b>Черновик отклонён</b>")
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("rew_"))
@@ -221,23 +294,25 @@ async def cb_rewrite(callback: CallbackQuery, bot: Bot) -> None:
         )
 
 
-@router.callback_query(F.data.startswith("rej_"))
-async def cb_reject(callback: CallbackQuery) -> None:
-    post_id = int(callback.data.removeprefix("rej_"))
-    await db.set_post_status(post_id, "rejected")
-
-    await callback.message.edit_text("🗑 <b>Черновик отклонён</b>")
-    await callback.answer()
-
-
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     await db.init_db()
+    await autopilot.seed_default_sources()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        autopilot.run_autopilot_check,
+        trigger="interval",
+        hours=AUTOPILOT_INTERVAL_HOURS,
+        args=[bot],
+        id="autopilot_check",
+    )
+    scheduler.start()
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
@@ -245,4 +320,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
